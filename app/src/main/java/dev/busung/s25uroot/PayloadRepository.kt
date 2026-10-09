@@ -7,6 +7,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import org.json.JSONObject
 
 data class VerifiedPayloads(
@@ -16,12 +17,14 @@ data class VerifiedPayloads(
 )
 
 class PayloadRepository(private val context: Context) {
+    private val commitCache = ConcurrentHashMap<String, String>()
+
     fun loadTargets(): List<TargetProfile> {
-        val commit = resolveMainCommit()
-        val manifestBytes = downloadBytes(rawUrl(commit, "support/targets-v3.json"), MAX_MANIFEST_BYTES)
+        val commit = resolveMainCommit(FEED_OWNER)
+        val manifestBytes = downloadBytes(pinnedUrl(FEED_OWNER, commit, "support/targets-v3.json"), MAX_MANIFEST_BYTES)
         return SupportManifest.parse(manifestBytes).targets.map { profile -> profile.copy(
-            exploit = profile.exploit.copy(url = pinArtifactUrl(profile.exploit.url, commit)),
-            kernelSu = profile.kernelSu.copy(url = pinArtifactUrl(profile.kernelSu.url, commit)),
+            exploit = profile.exploit.copy(url = pinArtifactUrl(profile.exploit.url)),
+            kernelSu = profile.kernelSu.copy(url = pinArtifactUrl(profile.kernelSu.url)),
         ) }
     }
 
@@ -90,20 +93,26 @@ class PayloadRepository(private val context: Context) {
         return destination
     }
 
-    private fun resolveMainCommit(): String {
-        val response = downloadBytes(COMMIT_API_URL, MAX_COMMIT_RESPONSE_BYTES)
-        val commit = JSONObject(response.toString(Charsets.UTF_8))
+    // The feed mixes upstream and fork artifacts, so each owner pins to its own main commit.
+    private fun resolveMainCommit(owner: String): String = commitCache.getOrPut(owner) {
+        val response = downloadBytes(
+            "https://api.github.com/repos/$owner/$REPOSITORY_NAME/git/ref/heads/main",
+            MAX_COMMIT_RESPONSE_BYTES,
+        )
+        JSONObject(response.toString(Charsets.UTF_8))
             .getJSONObject("object")
             .getString("sha")
-        require(commit.matches(Regex("[0-9a-f]{40}"))) { context.getString(R.string.repo_commit_invalid) }
-        return commit
+            .also { require(it.matches(Regex("[0-9a-f]{40}"))) { context.getString(R.string.repo_commit_invalid) } }
     }
 
-    private fun rawUrl(commit: String, path: String) = "$RAW_REPOSITORY/$commit/$path"
+    private fun pinnedUrl(owner: String, commit: String, path: String) =
+        "https://raw.githubusercontent.com/$owner/$REPOSITORY_NAME/$commit/$path"
 
-    private fun pinArtifactUrl(url: String, commit: String): String {
-        require(url.startsWith(MUTABLE_RAW_PREFIX)) { context.getString(R.string.repo_url_invalid) }
-        return "$RAW_REPOSITORY/$commit/${url.removePrefix(MUTABLE_RAW_PREFIX)}"
+    private fun pinArtifactUrl(url: String): String {
+        val match = MUTABLE_RAW_URL.matchEntire(url)
+        require(match != null) { context.getString(R.string.repo_url_invalid) }
+        val (owner, path) = match.destructured
+        return pinnedUrl(owner, resolveMainCommit(owner), path)
     }
 
     private fun downloadBytes(url: String, maximum: Int): ByteArray {
@@ -136,11 +145,11 @@ class PayloadRepository(private val context: Context) {
         }
 
     companion object {
-        private const val COMMIT_API_URL =
-            "https://api.github.com/repos/minhmc2007/Root-My-Galaxy-Payloads/git/ref/heads/main"
-        private const val RAW_REPOSITORY =
-            "https://raw.githubusercontent.com/minhmc2007/Root-My-Galaxy-Payloads"
-        private const val MUTABLE_RAW_PREFIX = "$RAW_REPOSITORY/main/"
+        private const val REPOSITORY_NAME = "Root-My-Galaxy-Payloads"
+        private const val FEED_OWNER = "minhmc2007"
+        private val MUTABLE_RAW_URL = Regex(
+            "https://raw\\.githubusercontent\\.com/([A-Za-z0-9-]+)/$REPOSITORY_NAME/main/(.+)",
+        )
         private const val MAX_COMMIT_RESPONSE_BYTES = 16 * 1024
         private const val MAX_MANIFEST_BYTES = 256 * 1024
     }
